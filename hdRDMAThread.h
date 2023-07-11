@@ -59,6 +59,7 @@ class hdRDMAThread{
 		~hdRDMAThread();
 		
 		void ThreadRun(int sockfd);
+		void SetUIDGID(void);
 		void PostWR( int id ); // id= index to buffers
 		void ExchangeQPInfo( int sockfd );
 		void CreateQP(void);

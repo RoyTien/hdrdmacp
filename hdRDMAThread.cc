@@ -6,22 +6,34 @@
 #include <strings.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <pwd.h>
+#include <grp.h>
+#include <sys/fsuid.h>
+#include <iterator>
+#include <mutex>
+#include <set>
 
 #include <zlib.h>
 
 #include "hdRDMA.h"
 
-
-using std::cout;
-using std::cerr;
-using std::endl;
-using std::atomic;
+using namespace std;
 using std::chrono::duration;
 using std::chrono::duration_cast;
 using std::chrono::high_resolution_clock;
 
 extern atomic<uint64_t> BYTES_RECEIVED_TOT;
+extern atomic<uint64_t> NFILES_RECEIVED_TOT;
 extern std::string HDRDMA_REMOTE_ADDR;
+extern int VERBOSE;
+extern int HDRDMA_RET_VAL;
+extern string HDRDMA_USERNAME;
+extern string HDRDMA_GROUPNAME;
+extern std::mutex HDRDMA_RECV_FNAMES_MUTEX;
+extern std::set<string> HDRDMA_RECV_FNAMES;
+
+
+extern string SendControlCommand(string host, string command);
 
 //
 // Some notes on server mode:
@@ -92,6 +104,8 @@ hdRDMAThread::~hdRDMAThread()
 //----------------------------------------------------------------------
 void hdRDMAThread::ThreadRun(int sockfd)
 {
+	pthread_setname_np( pthread_self(), "hdRDMAThread::ThreadRun" );
+
 	// The first thing we send via TCP is a 3 byte message indicating
 	// success or failure. This really just allows us to inform the client
 	// if the server cannot accept another connection right now due to
@@ -148,6 +162,11 @@ void hdRDMAThread::ThreadRun(int sockfd)
 		cerr << e.what() << endl;
 		return;
 	}
+
+	// Set the filesystem UID/GID if specified by the user. This is primarily for when this is
+	// run as root (e.g. as a service) so it can interact with the filesystem as an unpriviliged
+	// user.
+	SetUIDGID();
 	
 	// Loop until we're told to stop by either the master thread or the
 	// remote peer declaring the connection is closing.
@@ -208,6 +227,78 @@ void hdRDMAThread::ThreadRun(int sockfd)
 
 	} // while( !stop )
 
+}
+
+//-------------------------------------------------------------
+// SetUIDGID
+//
+// This is called to (optionally) set the filesystem uid and gid
+// of the process when run in server mode. This is called by
+// each hdRDMAThread since the fsuid and fsgid must be set for
+// each thread.
+//-------------------------------------------------------------
+void hdRDMAThread::SetUIDGID(void)
+{
+	// Note that this calls setfsuid and setfsgid to set the
+	// user and group ids when dealing with the filesystem
+	// ONLY. This feature is here to allow the server to be
+	// started by root, but ensure the creation of files is
+	// done as an unpriviliged user.
+	//
+	// It is worth noting that using seteuid and setreuid were
+	// originally tried here, but would cause problems that
+	// looked very similar to issues when the memorylocked size
+	// was to small. I suspect changing the process IDs caused
+	// that limit to change.
+
+	// Create data structures on stack to use in calls to getgrnam_r
+	// and getpwnam_r. These are used instead of getgrnam and
+	// getpwnam because some problems were seen with files
+	// getting assigned strange uids when multiple files were
+	// being sent to a server simultaneously. I speculate this
+	// was caused by multiple threads simultaneously calling these
+	// which, according to the man page, recycle the same memory.
+	struct passwd pwd;
+	struct passwd *passwd=NULL; // will be set to either NULL or &pwd
+	struct group grp;
+	struct group *group=NULL;  // will be set to either NULL or &grp
+	char buf[8192];
+	size_t buflen = 8192;
+
+	// Set effective gid if specified by user
+	if( HDRDMA_GROUPNAME.length()>0 ){
+		getgrnam_r(HDRDMA_GROUPNAME.c_str(), &grp, buf, buflen, &group);
+		//auto group = getgrnam(HDRDMA_GROUPNAME.c_str());
+		if( !group ){
+			cerr << "Unknown group name \"" << HDRDMA_GROUPNAME << "\"!" << endl;
+			exit(-53);
+		}
+		cout << "Setting fsgid to " << group->gr_gid << " (group=" << group->gr_name << ")" << endl;
+		if( setfsgid(group->gr_gid) != 0 ){
+			perror("setegid() error");
+		}
+	}
+
+	// Set effective uid if specified by user
+	if( HDRDMA_USERNAME.length()>0 ){
+		getpwnam_r(HDRDMA_USERNAME.c_str(), &pwd, buf, buflen, &passwd);
+		//auto passwd = getpwnam(HDRDMA_USERNAME.c_str());
+		if( !passwd ){
+			cerr << "Unknown username \"" << HDRDMA_USERNAME << "\"!" << endl;
+			exit(-52);
+		}
+		if( HDRDMA_GROUPNAME.empty() ){
+			// User did not explicitly set group name so set it to default group
+			if(VERBOSE>1)cout << "Setting fsgid to " << passwd->pw_gid << " (default for user " << passwd->pw_name << ")" << endl;
+			if( setfsgid(passwd->pw_gid) != 0 ){
+				perror("setefsgid() error");
+			}
+		}
+		cout << "Setting fsuid to " << passwd->pw_uid << " (username=" << passwd->pw_name << ")" << endl;
+		if( setfsuid(passwd->pw_uid) != 0 ){
+			perror("setfsuid() error");
+		}
+	}
 }
 
 //-------------------------------------------------------------
@@ -428,10 +519,10 @@ void hdRDMAThread::ReceiveBuffer(uint8_t *buff, uint32_t buff_len)
 				ofs = nullptr;
 			}
 			ofilename = (char*)&hi->payload;
-			cout << "Receiving file: " << ofilename << endl;
-			
+			if(VERBOSE>1)cout << "Receiving file: " << ofilename << endl;
+
 			// Create parent directory path if specified by remote sender
-			cout << "hi->flags: 0x" << std::hex << hi->flags << std::dec << endl;
+			if(VERBOSE>2)cout << "hi->flags: 0x" << std::hex << hi->flags << std::dec << endl;
 			if( hi->flags & HI_MAKE_PARENT_DIRS ){
 				auto pos = ofilename.find_last_of('/');
 				if( pos != std::string::npos ) makePath( ofilename.substr(0, pos) );
@@ -446,6 +537,10 @@ void hdRDMAThread::ReceiveBuffer(uint8_t *buff, uint32_t buff_len)
 			t_last = t1; // used for intermediate rate calculations
 			delta_t_io = 0.0;
 			Ntransferred = 0;
+
+			// Add filename to list of files currently being received
+			std::lock_guard<mutex> lck(HDRDMA_RECV_FNAMES_MUTEX);
+			HDRDMA_RECV_FNAMES.insert(ofilename);
 		}
 
 		if( !ofs ){
@@ -470,13 +565,17 @@ void hdRDMAThread::ReceiveBuffer(uint8_t *buff, uint32_t buff_len)
 			if( t_last != t1 ) cout << endl; // print carriage return if we printed any intermediate progress
 			if( ofs ){
 				auto t_io_start = high_resolution_clock::now();
+				ofs->flush();
 				ofs->close();
 				auto t_io_end = high_resolution_clock::now();
 				duration<double> duration_io = duration_cast<duration<double>>(t_io_end-t_io_start);
 				delta_t_io += duration_io.count();
-				ofs->close();
 				delete ofs;
 				ofs = nullptr;
+				NFILES_RECEIVED_TOT++;
+
+				std::lock_guard<mutex> lck(HDRDMA_RECV_FNAMES_MUTEX);
+				HDRDMA_RECV_FNAMES.erase(ofilename);
 			}
 //			auto t2 = high_resolution_clock::now();
 //			duration<double> delta_t = duration_cast<duration<double>>(t2-t1);
@@ -720,9 +819,24 @@ void hdRDMAThread::SendFile(std::string srcfilename, std::string dstfilename, bo
 	if( calculate_checksum ) cout << "  checksum: " << std::hex << crcsum << std::dec << endl;
 	//cout << "  IB rate sending file: " << delta_t.count()-delta_t_io << " sec  (" << rate_ib_Gbps << " Gbps) - n.b. don't take this seriously!" << endl;
 
-	if( delete_after_send ){
-		unlink( srcfilename.c_str() );
-		cout <<"  Deleted src file: " << srcfilename << endl;
+	// Verify file was completely sent by checking file size on remote host
+	string response = SendControlCommand( HDRDMA_REMOTE_ADDR, string("get_file_size ") + dstfilename);
+//	cout << "response: " << response << endl;
+	std::vector<string> vals;
+	std::istringstream iss( response );
+	copy( std::istream_iterator<string>(iss), std::istream_iterator<string>(), back_inserter(vals) );
+	int64_t fsize = 0;
+	if( vals.size()>1 ) fsize = atoll( vals[1].c_str() );
+	if( fsize == filesize ){
+		cout << "  Confirmed remote file size matches local: " << fsize << " bytes" << endl;
+		if( delete_after_send ) {
+			unlink(srcfilename.c_str());
+			cout << "  Deleted src file: " << srcfilename << endl;
+		}
+	}else{
+		cerr << "Local and remote file sizes do not match after send! (" << filesize << " != " << fsize << ")" << endl;
+		cerr << "response from server was: " << response << endl;
+		HDRDMA_RET_VAL = -1;
 	}
 }
 
@@ -797,4 +911,3 @@ bool hdRDMAThread::makePath( const std::string &path )
 			return false;
 	}
 }
-

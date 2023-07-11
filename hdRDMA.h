@@ -62,4 +62,3 @@ class hdRDMA{
 		uint64_t Ntransferred_last = 0;
 		std::chrono::high_resolution_clock::time_point t_last;
 };
-
