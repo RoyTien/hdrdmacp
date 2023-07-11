@@ -50,9 +50,9 @@ hdRDMA::hdRDMA()
 			case IBV_TRANSPORT_IWARP:
 				transport_type = "IWARP";
 				break;
-			case IBV_EXP_TRANSPORT_SCIF:
-				transport_type = "SCIF";
-				break;
+			// case IBV_EXP_TRANSPORT_SCIF: // This will cause build fail.
+			// 	transport_type = "SCIF";
+			// 	break;
 			default:
 				transport_type = "UNKNOWN";
 				break;

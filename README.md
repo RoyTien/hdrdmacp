@@ -42,6 +42,9 @@ program though, it is also easy to just build it via a single command as shown.
 
 > c++ -o hdrdmacp *.cc -libverbs -lz
 
+According to the Issus - [Extra flags needed for build #2](https://github.com/JeffersonLab/hdrdmacp/issues/2), using new command to build.
+> c++ -I . -o hdrdmacp *.cc -libverbs -lz -pthread
+
 ## Running
 
 Run the program with "--help" to get the help statement:
